@@ -1,0 +1,9 @@
+{
+    "design": "ibex RISC-V Core",
+    "pdk": "ASAP7 7nm",
+    "tool": "OpenROAD",
+    "clock_name": "core_clock",
+    "clock_period_ps": 1000,
+    "reports_dir": "./reports",
+    "chroma_dir": "./chroma_db"
+}
