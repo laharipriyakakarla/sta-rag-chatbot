@@ -1,12 +1,13 @@
 """
 chunker.py
-Parses OpenROAD timing reports into per-path chunks with metadata.
+Parses OpenROAD and PrimeTime timing reports into per-path chunks with metadata.
+Auto-detects report format per file.
 Each chunk = one timing path (Startpoint → slack line).
 """
 
 import re
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -19,88 +20,104 @@ class TimingPath:
     slack: float
     slack_status: str       # MET or VIOLATED
     stage: str              # which report file (e.g. 6_finish)
+    tool: str               # 'openroad' or 'primetime'
     raw_text: str           # full path text for embedding
     data_arrival_time: Optional[float] = None
     data_required_time: Optional[float] = None
 
 
+# ── Format detection ────────────────────────────────────────────────────────────
+
+def detect_format(content: str) -> str:
+    """
+    Detect whether the report is from OpenROAD or PrimeTime.
+    PrimeTime uses 'Point ... Incr ... Path' column header.
+    OpenROAD uses 'Delay ... Time ... Description' column header.
+    """
+    if re.search(r"^\s+Point\s+.*Incr\s+.*Path", content, re.MULTILINE):
+        return "primetime"
+    return "openroad"
+
+
+# ── Stage name ──────────────────────────────────────────────────────────────────
+
 def parse_stage_name(filepath: str) -> str:
-    """Extract stage name from filename e.g. '6_finish' from '6_finish.rpt'"""
     basename = os.path.basename(filepath)
-    return basename.replace(".rpt", "")
+    for ext in (".rpt", ".txt", ".log"):
+        basename = basename.replace(ext, "")
+    return basename
 
 
-def parse_report(filepath: str) -> list[TimingPath]:
-    """Parse a single .rpt file and return list of TimingPath objects."""
-    stage = parse_stage_name(filepath)
+# ── Shared header parser (same for both tools) ──────────────────────────────────
 
-    with open(filepath, "r") as f:
-        content = f.read()
+def parse_header(lines: list[str]) -> dict:
+    """Parse Startpoint/Endpoint/Path Group/Path Type — identical in both tools."""
+    result = {
+        "startpoint": None,
+        "endpoint": None,
+        "path_group": None,
+        "path_type": None,
+    }
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
 
-    # Split on "Startpoint:" to get individual path blocks
-    # First element is usually header/summary before first path
-    raw_blocks = re.split(r"(?=^Startpoint:)", content, flags=re.MULTILINE)
+        if line.startswith("Startpoint:"):
+            val = line.replace("Startpoint:", "").strip()
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if nxt and not any(nxt.startswith(k) for k in
+                        ["Endpoint:", "Path Group:", "Path Type:", "Fanout",
+                         "Point", "---", "Cap", "Delay"]):
+                    val += " " + nxt
+                    i += 1
+            result["startpoint"] = val
 
-    paths = []
-    for block in raw_blocks:
-        block = block.strip()
-        if not block.startswith("Startpoint:"):
-            continue
+        elif line.startswith("Endpoint:"):
+            val = line.replace("Endpoint:", "").strip()
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if nxt and not any(nxt.startswith(k) for k in
+                        ["Path Group:", "Path Type:", "Fanout",
+                         "Point", "---", "Cap", "Delay"]):
+                    val += " " + nxt
+                    i += 1
+            result["endpoint"] = val
 
-        path = extract_path(block, stage)
-        if path:
-            paths.append(path)
+        elif line.startswith("Path Group:"):
+            result["path_group"] = line.replace("Path Group:", "").strip()
 
-    return paths
+        elif line.startswith("Path Type:"):
+            result["path_type"] = line.replace("Path Type:", "").strip()
+
+        i += 1
+    return result
 
 
-def extract_path(block: str, stage: str) -> Optional[TimingPath]:
-    """Extract structured data from a single path block."""
+# ── OpenROAD parser ─────────────────────────────────────────────────────────────
+
+def extract_path_openroad(block: str, stage: str) -> Optional[TimingPath]:
+    """Parse a single path block from an OpenROAD report."""
     lines = block.splitlines()
+    header = parse_header(lines)
 
-    startpoint = None
-    endpoint = None
-    path_group = None
-    path_type = None
     slack = None
     slack_status = None
     data_arrival_time = None
     data_required_time = None
 
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    for line in lines:
+        stripped = line.strip()
 
-        # Startpoint (may span 2 lines)
-        if line.startswith("Startpoint:"):
-            startpoint = line.replace("Startpoint:", "").strip()
-            # check if next line is continuation (indented, no keyword)
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if next_line and not any(next_line.startswith(k) for k in
-                        ["Endpoint:", "Path Group:", "Path Type:", "Fanout", "---"]):
-                    startpoint += " " + next_line
-                    i += 1
+        if "slack (MET)" in stripped or "slack (VIOLATED)" in stripped:
+            # OpenROAD: "   63.96   slack (MET)"  — value BEFORE keyword
+            match = re.search(r"([-\d.]+)\s+slack\s+\((MET|VIOLATED)\)", stripped)
+            if match:
+                slack = float(match.group(1))
+                slack_status = match.group(2)
 
-        # Endpoint (may span 2 lines)
-        elif line.startswith("Endpoint:"):
-            endpoint = line.replace("Endpoint:", "").strip()
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if next_line and not any(next_line.startswith(k) for k in
-                        ["Path Group:", "Path Type:", "Fanout", "---"]):
-                    endpoint += " " + next_line
-                    i += 1
-
-        elif line.startswith("Path Group:"):
-            path_group = line.replace("Path Group:", "").strip()
-
-        elif line.startswith("Path Type:"):
-            path_type = line.replace("Path Type:", "").strip()
-
-        elif "data arrival time" in line:
-            parts = line.split()
-            # value is always the last number on the line
+        elif "data arrival time" in stripped:
+            parts = stripped.split()
             for part in reversed(parts):
                 try:
                     data_arrival_time = float(part)
@@ -108,8 +125,8 @@ def extract_path(block: str, stage: str) -> Optional[TimingPath]:
                 except ValueError:
                     continue
 
-        elif "data required time" in line and "library" not in line:
-            parts = line.split()
+        elif "data required time" in stripped and "library" not in stripped:
+            parts = stripped.split()
             for part in reversed(parts):
                 try:
                     data_required_time = float(part)
@@ -117,25 +134,20 @@ def extract_path(block: str, stage: str) -> Optional[TimingPath]:
                 except ValueError:
                     continue
 
-        elif "slack (MET)" in line or "slack (VIOLATED)" in line:
-            # OpenROAD format: "   63.96   slack (MET)" — value is BEFORE the keyword
-            match = re.search(r"([-\d.]+)\s+slack\s+\((MET|VIOLATED)\)", line)
-            if match:
-                slack = float(match.group(1))
-                slack_status = match.group(2)
-
-        i += 1
-
-    # Only return if we got the essential fields
-    if all(v is not None for v in [startpoint, endpoint, path_group, path_type, slack, slack_status]):
+    if all(v is not None for v in [
+        header["startpoint"], header["endpoint"],
+        header["path_group"], header["path_type"],
+        slack, slack_status
+    ]):
         return TimingPath(
-            startpoint=startpoint,
-            endpoint=endpoint,
-            path_group=path_group,
-            path_type=path_type,
+            startpoint=header["startpoint"],
+            endpoint=header["endpoint"],
+            path_group=header["path_group"],
+            path_type=header["path_type"],
             slack=slack,
             slack_status=slack_status,
             stage=stage,
+            tool="openroad",
             raw_text=block,
             data_arrival_time=data_arrival_time,
             data_required_time=data_required_time,
@@ -143,18 +155,116 @@ def extract_path(block: str, stage: str) -> Optional[TimingPath]:
     return None
 
 
+# ── PrimeTime parser ────────────────────────────────────────────────────────────
+
+def extract_path_primetime(block: str, stage: str) -> Optional[TimingPath]:
+    """
+    Parse a single path block from a PrimeTime report.
+
+    PrimeTime slack line format:
+        slack (MET)                          1.31
+        slack (VIOLATED)                    -0.45
+    Value is AFTER the keyword (opposite of OpenROAD).
+    """
+    lines = block.splitlines()
+    header = parse_header(lines)
+
+    slack = None
+    slack_status = None
+    data_arrival_time = None
+    data_required_time = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("slack (MET)") or stripped.startswith("slack (VIOLATED)"):
+            # PrimeTime: "slack (MET)    1.31" — value AFTER keyword
+            match = re.search(r"slack\s+\((MET|VIOLATED)\)\s+([-\d.]+)", stripped)
+            if match:
+                slack_status = match.group(1)
+                slack = float(match.group(2))
+
+        elif stripped.startswith("data arrival time"):
+            parts = stripped.split()
+            for part in reversed(parts):
+                try:
+                    data_arrival_time = float(part)
+                    break
+                except ValueError:
+                    continue
+
+        elif stripped.startswith("data required time") and "library" not in stripped:
+            parts = stripped.split()
+            for part in reversed(parts):
+                try:
+                    data_required_time = float(part)
+                    break
+                except ValueError:
+                    continue
+
+    if all(v is not None for v in [
+        header["startpoint"], header["endpoint"],
+        header["path_group"], header["path_type"],
+        slack, slack_status
+    ]):
+        return TimingPath(
+            startpoint=header["startpoint"],
+            endpoint=header["endpoint"],
+            path_group=header["path_group"],
+            path_type=header["path_type"],
+            slack=slack,
+            slack_status=slack_status,
+            stage=stage,
+            tool="primetime",
+            raw_text=block,
+            data_arrival_time=data_arrival_time,
+            data_required_time=data_required_time,
+        )
+    return None
+
+
+# ── Main parse functions ────────────────────────────────────────────────────────
+
+def parse_report(filepath: str) -> list[TimingPath]:
+    """Parse a single report file — auto-detects OpenROAD vs PrimeTime."""
+    stage = parse_stage_name(filepath)
+
+    with open(filepath, "r") as f:
+        content = f.read()
+
+    fmt = detect_format(content)
+    extractor = extract_path_primetime if fmt == "primetime" else extract_path_openroad
+
+    raw_blocks = re.split(r"(?=^Startpoint:)", content, flags=re.MULTILINE)
+
+    paths = []
+    for block in raw_blocks:
+        block = block.strip()
+        if not block.startswith("Startpoint:"):
+            continue
+        path = extractor(block, stage)
+        if path:
+            paths.append(path)
+
+    return paths
+
+
 def parse_all_reports(reports_dir: str) -> list[TimingPath]:
-    """Parse all .rpt files in a directory."""
-    rpt_files = sorted([
+    """Parse all .rpt/.txt/.log files in a directory."""
+    extensions = (".rpt", ".txt", ".log")
+    report_files = sorted([
         os.path.join(reports_dir, f)
         for f in os.listdir(reports_dir)
-        if f.endswith(".rpt")
+        if f.endswith(extensions)
     ])
 
     all_paths = []
-    for rpt_file in rpt_files:
+    for rpt_file in report_files:
+        with open(rpt_file, "r") as f:
+            content = f.read()
+        fmt = detect_format(content)
         paths = parse_report(rpt_file)
-        print(f"  {os.path.basename(rpt_file)}: {len(paths)} paths parsed")
+        print(f"  {os.path.basename(rpt_file)}: {len(paths)} paths parsed [{fmt}]")
         all_paths.extend(paths)
 
     return all_paths
@@ -168,11 +278,12 @@ def summarize(paths: list[TimingPath]):
     print(f"\nPath groups: {set(p.path_group for p in paths)}")
     print(f"Path types:  {set(p.path_type for p in paths)}")
     print(f"Stages:      {set(p.stage for p in paths)}")
+    print(f"Tools:       {set(p.tool for p in paths)}")
 
     worst = min(paths, key=lambda p: p.slack)
     best  = max(paths, key=lambda p: p.slack)
-    print(f"\nWorst slack: {worst.slack} ({worst.slack_status}) — {worst.startpoint[:60]}")
-    print(f"Best slack:  {best.slack}  ({best.slack_status}) — {best.startpoint[:60]}")
+    print(f"\nWorst slack: {worst.slack} ({worst.slack_status}) [{worst.tool}] — {worst.startpoint[:60]}")
+    print(f"Best slack:  {best.slack}  ({best.slack_status}) [{best.tool}] — {best.startpoint[:60]}")
 
 
 if __name__ == "__main__":
