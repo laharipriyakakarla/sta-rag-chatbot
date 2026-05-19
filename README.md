@@ -153,6 +153,6 @@ The chatbot was designed to show how RAG can make timing closure data queryable 
 
 ## Author
 
-**Lahari Kakarlala**  
+**Lahari Priya Kakarla**  
 MS Electrical Engineering, Arizona State University  
 Specialization: ASIC Physical Design & Static Timing Analysis
